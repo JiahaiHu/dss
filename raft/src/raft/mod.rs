@@ -137,6 +137,9 @@ impl Raft {
     }
 
     fn set_state(&mut self, term: u64, is_leader: bool, is_candidate: bool) {
+        if term > self.state.term() {
+            self.voted_for = None;  // clear voted_for
+        }
         self.state = State {
             term,
             is_leader,
@@ -322,8 +325,8 @@ impl Node {
 
     fn start_election(&self) {
         let mut rf = self.raft.lock().unwrap();
-        debug!("{}: start election", rf.me);
         let mut term = rf.state.term();
+        debug!("{}: start election of term {}", rf.me, term + 1);
         // Increment currentTerm.
         term += 1;
         rf.set_state(term, false, true);    // followers -> candidate
@@ -346,20 +349,24 @@ impl Node {
             if i == rf.me {
                 continue;
             }
+            let peer = rf.peers[i].clone();
             let node = self.clone();
             let args = args.clone();
             let votes = Arc::clone(&votes);
             let peers_len = peers_len;
             let term = term;
+            let me = rf.me;
             thread::spawn(move || {
-                let mut rf = node.raft.lock().unwrap();
-                if let Ok(reply) = rf.peers[i].request_vote(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
+                debug!("{}: send RequestVote rpc to {}", me, i);
+                if let Ok(reply) = peer.request_vote(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
+                    let mut rf = node.raft.lock().unwrap();
                     if reply.vote_granted {
                         votes.fetch_add(1, Ordering::SeqCst);
                         debug!("votes: {}", votes.load(Ordering::SeqCst));
                         if votes.load(Ordering::SeqCst) > peers_len / 2
                             && rf.state.is_candidate() && term == rf.state.term()
                         {   // win the election of this term
+                            debug!("{}: win the election of term {}", rf.me, term);
                             rf.set_state(term, true, false);    // candidate -> leader
                             rf.next_index = Some(vec![rf.log.len() as u64; peers_len]);
                             rf.matched_index = Some(vec![0; peers_len]);
@@ -371,13 +378,14 @@ impl Node {
                             node.restart_election_timer();
                             node.stop_heartbeat_timer();
                         } else {    // not won yet
-                            debug!("{}: step down, reset election timer", rf.me);
                             node.reset_election_timer();
                         }
                         // step down (candidate -> follower)
+                        debug!("{}: step down while elect", rf.me);
                         rf.set_state(reply.term, false, false);
                     }
                 }
+                debug!("{} to {} thread end", me, i);
             });
         }
     }
@@ -412,6 +420,7 @@ impl Node {
 
     fn heartbeat(&self) {
         let rf = self.raft.lock().unwrap();
+        debug!("{}: heartbeat", rf.me);
         let peers_len = rf.peers_len();
         for i in 0..peers_len {
             if i == rf.me {
@@ -432,10 +441,11 @@ impl Node {
                 entries,
                 leader_commit: rf.commit_index,
             };
+            let peer = rf.peers[i].clone();
             let node = self.clone();
             thread::spawn(move || {
-                let mut rf = node.raft.lock().unwrap();
-                if let Ok(reply) = rf.peers[i].append_entries(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
+                if let Ok(reply) = peer.append_entries(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
+                    let mut rf = node.raft.lock().unwrap();
                     if reply.success {
                         if reply.term == rf.state.term() {
                             // update next_index and matched_index
@@ -529,22 +539,24 @@ impl RaftService for Node {
             vote_granted: false,
         };
 
+        debug!("{}: receive RequestVote rpc", rf.me);
         if args.term >= rf.state.term() {
             if rf.state.is_leader() {
                 self.restart_election_timer();
                 self.stop_heartbeat_timer();
             } else {
-                debug!("{}: reveive RPC, reset election timer", rf.me);
+                debug!("{}: receive RPC, reset election timer", rf.me);
                 self.reset_election_timer();
             }
             // step down
             rf.set_state(args.term, false, false);
+
             if rf.voted_for == None || rf.voted_for == Some(args.candidate_id as usize) {
                 let log_index = args.last_log_index;
                 let log_term = args.last_log_term;
                 let last_index = rf.log.len() - 1;
-                // debug!("args_log_term: {}, args_log_index: {}, last_log_term: {}, last_log_index: {}",
-                //     log_term, log_index, rf.log[last_index].term, rf.log[last_index].term);
+                debug!("args_log_term: {}, args_log_index: {}, last_log_term: {}, last_log_index: {}",
+                    log_term, log_index, rf.log[last_index].term, rf.log[last_index].term);
                 if log_term > rf.log[last_index].term || log_term == rf.log[last_index].term && log_index >= last_index as u64 {
                     debug!("{}: vote for {}", rf.me, args.candidate_id);
                     reply.vote_granted = true;
@@ -573,7 +585,6 @@ impl RaftService for Node {
             }
             // step down
             rf.set_state(args.term, false, false);
-            
             let log_index = args.prev_log_index as usize;
             if log_index < rf.log.len() && args.prev_log_term == rf.log[log_index].term {   // match
                 reply.success = true;
