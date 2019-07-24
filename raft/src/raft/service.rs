@@ -58,4 +58,6 @@ pub struct AppendEntriesReply {
     pub term: u64,
     #[prost(bool, tag = "2")]
     pub success: bool,
+    #[prost(uint64, tag = "3")]
+    pub expected_next_index: u64,
 }

@@ -535,14 +535,15 @@ impl Node {
                 entries,
                 leader_commit: rf.commit_index,
             };
-            debug!("term: {}, leader_id: {}, prev_log_index: {}, prev_log_term: {}, leader_commit: {}, entries_len: {}",
-                args.term, args.leader_id, prev_log_index, prev_log_term, args.leader_commit, args.entries.len());
+            
             let peer = rf.peers[i].clone();
             let node = self.clone();
             let me = rf.me;
             let result = thread::Builder::new().spawn(move || {
             //thread::spawn(move || {
                 debug!("{}: send AE rpc to {}", me, i);
+                debug!("{} -> {} term: {}, leader_id: {}, prev_log_index: {}, prev_log_term: {}, leader_commit: {}, entries_len: {}", me, i,
+                    args.term, args.leader_id, args.prev_log_index, args.prev_log_term, args.leader_commit, args.entries.len());
                 if let Ok(reply) = peer.append_entries(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
                     let mut rf = node.raft.lock().unwrap();
                     if reply.success {
@@ -581,7 +582,7 @@ impl Node {
                         rf.set_state(reply.term, false, false);
                     } else if reply.term == rf.state.term() {  // mismatch
                         let mut next_index = rf.next_index.clone().unwrap();
-                        next_index[i] = rf.next_index.clone().unwrap()[i] - 1;
+                        next_index[i] = reply.expected_next_index;
                         rf.next_index = Some(next_index);
                     }
                 }
@@ -702,9 +703,10 @@ impl RaftService for Node {
         let mut reply = AppendEntriesReply {
             success: false,
             term: rf.state.term(),
+            expected_next_index: rf.commit_index + 1,
         };
 
-        debug!("{}: receive AE rpc", rf.me);
+        debug!("{}: receive AE rpc from {}", rf.me, args.leader_id);
         if args.term >= rf.state.term() {
             if rf.state.is_leader() {
                 self.restart_election_timer();
@@ -715,8 +717,8 @@ impl RaftService for Node {
             // step down
             rf.set_state(args.term, false, false);
             let log_index = args.prev_log_index as usize;
-            if log_index < rf.log.len() {   // match
-                if args.prev_log_term == rf.log[log_index].term {
+            if log_index < rf.log.len() {
+                if args.prev_log_term == rf.log[log_index].term {   // match
                     debug!("{}: log match", rf.me);
                     reply.success = true;
                     for i in 0..args.entries.len() {
@@ -744,7 +746,17 @@ impl RaftService for Node {
                     // update commitIndex
                     let new_commit_index = cmp::min(args.leader_commit, rf.log.len() as u64 - 1);
                     rf.set_commit_index(new_commit_index);
-                } else {
+                } else {    // mismatch
+                    let mut expected_next_index = log_index;
+                    let term = args.prev_log_term;
+                    for i in (0..log_index).rev() {
+                        if term == rf.log[i].term {
+                            expected_next_index = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    reply.expected_next_index = expected_next_index as u64;
                     let _ = rf.log.drain(log_index..);
                     rf.persist();
                 }
