@@ -517,7 +517,9 @@ impl Node {
                         // step down (leader -> follower)
                         rf.set_state(reply.term, false, false);
                     } else if reply.term == rf.state.term() {  // mismatch
-                        rf.next_index.clone().unwrap()[i] -= 1;
+                        let mut next_index = rf.next_index.clone().unwrap();
+                        next_index[i] = rf.next_index.clone().unwrap()[i] - 1;
+                        rf.next_index = Some(next_index);
                     }
                 }
                 debug!("{} to {} thread end", me, i);
