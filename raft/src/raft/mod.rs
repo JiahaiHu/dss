@@ -82,6 +82,20 @@ impl State {
     }
 }
 
+#[derive(Message)]
+pub struct PersistentState {
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
+    #[prost(int64, tag = "2")]
+    pub voted_for: i64,
+    #[prost(bytes, repeated, tag = "3")]
+    pub log: Vec<Vec<u8>>,
+    #[prost(uint64, tag = "4")]
+    commit_index: u64,
+    #[prost(uint64, tag = "5")]
+    last_applied: u64,
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -149,7 +163,8 @@ impl Raft {
             term,
             is_leader,
             is_candidate,
-        }
+        };
+        self.persist();
     }
 
     pub fn peers_len(&self) -> usize {
@@ -169,7 +184,7 @@ impl Raft {
             let _ = self.apply_ch.unbounded_send(apply_msg);
             self.last_applied += 1;
         }
-
+        self.persist();
     }
 
     /// save Raft's persistent state to stable storage,
@@ -181,6 +196,25 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let mut encode = vec![];
+        let mut voted_for: i64 = -1;
+        if self.voted_for.is_some() {
+            voted_for = self.voted_for.unwrap() as i64;
+        };
+        let mut p_state = PersistentState {
+            term: self.state.term(),
+            voted_for,
+            log: vec![],
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
+        };
+        for i in 1..self.log.len() {
+            let mut buf = vec![];
+            let _ = labcodec::encode(&self.log[i], &mut buf).map_err(Error::Encode);
+            p_state.log.push(buf);
+        }
+        let _ = labcodec::encode(&p_state, &mut encode).map_err(Error::Encode);
+        self.persister.save_raft_state(encode);
     }
 
     /// restore previously persisted state.
@@ -200,6 +234,29 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        if let Ok(decode) = labcodec::decode(data) {
+            let p_state: PersistentState = decode;
+            let state = State {
+                term: p_state.term,
+                is_leader: false,
+                is_candidate: false,
+            };
+            self.state = state;
+            self.commit_index = p_state.commit_index;
+            self.last_applied = p_state.last_applied;
+            if p_state.voted_for == -1 {
+                self.voted_for = None;
+            } else if p_state.voted_for >= 0 {
+                self.voted_for = Some(p_state.voted_for as usize);
+            }
+            for i in 0..p_state.log.len() {
+                let encode = p_state.log[i].clone();
+                if let Ok(decode) = labcodec::decode(&encode) {
+                    let entry: LogEntry = decode;
+                    self.log.push(entry);
+                }
+            }
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -254,6 +311,7 @@ impl Raft {
                 command: buf,
             };
             self.log.push(entry);
+            self.persist();
             Ok((index as u64, term))
         } else {
             Err(Error::NotLeader)
@@ -623,7 +681,7 @@ impl RaftService for Node {
                     // debug!("{}: vote for {}", rf.me, args.candidate_id);
                     reply.vote_granted = true;
                     rf.voted_for = Some(args.candidate_id as usize);
-                    // TODO: persist
+                    rf.persist();
                 }
             }
         }
@@ -662,6 +720,7 @@ impl RaftService for Node {
                             if append_index >= rf.log.len() {
                                 debug!("{}: append entry(index:{})", rf.me, append_index);
                                 rf.log.push(entry);
+                                rf.persist();
                                 continue;
                             }
                             if entry == rf.log[append_index] {
@@ -670,6 +729,7 @@ impl RaftService for Node {
                                 // delete the existing entry and all that follow it
                                 let _ = rf.log.drain(append_index..);
                                 rf.log.push(entry);
+                                rf.persist();
                             }
                         }
                     }
@@ -678,6 +738,7 @@ impl RaftService for Node {
                     rf.set_commit_index(new_commit_index);
                 } else {
                     let _ = rf.log.drain(log_index..);
+                    rf.persist();
                 }
             }
         }
