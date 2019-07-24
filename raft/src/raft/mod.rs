@@ -439,7 +439,8 @@ impl Node {
             let peers_len = peers_len;
             let term = term;
             let me = rf.me;
-            thread::spawn(move || {
+            let result = thread::Builder::new().spawn(move || {
+            // thread::spawn(move || {
                 // debug!("{}: send RequestVote rpc to {}", me, i);
                 if let Ok(reply) = peer.request_vote(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
                     let mut rf = node.raft.lock().unwrap();
@@ -475,6 +476,9 @@ impl Node {
                 }
                 // debug!("{} to {} thread end", me, i);
             });
+            if let Err(e) = result {
+                println!("{} to {} RV thread spawn: {}", me, i, e);
+            }
         }
     }
 
@@ -536,7 +540,8 @@ impl Node {
             let peer = rf.peers[i].clone();
             let node = self.clone();
             let me = rf.me;
-            thread::spawn(move || {
+            let result = thread::Builder::new().spawn(move || {
+            //thread::spawn(move || {
                 debug!("{}: send AE rpc to {}", me, i);
                 if let Ok(reply) = peer.append_entries(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
                     let mut rf = node.raft.lock().unwrap();
@@ -582,6 +587,9 @@ impl Node {
                 }
                 debug!("{} to {} thread end", me, i);
             });
+            if let Err(e) = result {
+                println!("{} to {} AE thread spawn: {}", me, i, e);
+            }
         }
     }
 
