@@ -395,11 +395,11 @@ impl Node {
                             rf.set_state(term, true, false);    // candidate -> leader
                             rf.next_index = Some(vec![rf.log.len() as u64; peers_len]);
                             rf.matched_index = Some(vec![0; peers_len]);
-                            let blank_entry = LogEntry {
-                                term,
-                                command: Vec::new(),
-                            };
-                            rf.log.push(blank_entry);
+                            // let blank_entry = LogEntry {
+                            //     term,
+                            //     command: Vec::new(),
+                            // };
+                            // rf.log.push(blank_entry);
                             node.stop_election_timer();
                             node.start_heartbeat_timer();
                         }
