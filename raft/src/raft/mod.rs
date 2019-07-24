@@ -157,8 +157,8 @@ impl Raft {
     }
 
     pub fn set_commit_index(&mut self, new_commit_index: u64) {
+        debug!("{}: update commit_index({})", self.me, new_commit_index);
         self.commit_index = new_commit_index;
-        ;
         for j in self.last_applied + 1..=self.commit_index {
             let apply_msg = ApplyMsg {
                 command_valid: true,
@@ -351,7 +351,7 @@ impl Node {
     fn start_election(&self) {
         let mut rf = self.raft.lock().unwrap();
         let mut term = rf.state.term();
-        // debug!("{}: start election of term {}", rf.me, term + 1);
+        debug!("{}: start election of term {}", rf.me, term + 1);
         // Increment currentTerm.
         term += 1;
         rf.set_state(term, false, true);    // followers -> candidate
@@ -395,6 +395,11 @@ impl Node {
                             rf.set_state(term, true, false);    // candidate -> leader
                             rf.next_index = Some(vec![rf.log.len() as u64; peers_len]);
                             rf.matched_index = Some(vec![0; peers_len]);
+                            let blank_entry = LogEntry {
+                                term,
+                                command: Vec::new(),
+                            };
+                            rf.log.push(blank_entry);
                             node.stop_election_timer();
                             node.start_heartbeat_timer();
                         }
@@ -489,15 +494,14 @@ impl Node {
                             rf.next_index = Some(next_index);
                             // update commit_index
                             for index in ((rf.commit_index + 1)..=matched_index[i]).rev() {
-                                let mut commits = 0;
+                                let mut appended = 1;
                                 for j in matched_index.clone() {
                                     if j >= index {
-                                        commits += 1;
+                                        appended += 1;
                                     }
                                 }
-                                debug!("commits: {}", commits);
-                                if commits > rf.peers.len() / 2 && rf.log[index as usize].term == rf.state.term(){
-                                    debug!("{}: update commit_index({})", me, index);
+                                debug!("appended: {}", appended);
+                                if appended > rf.peers.len() / 2 && rf.log[index as usize].term == rf.state.term(){
                                     rf.set_commit_index(index);
                                     break;
                                 }
@@ -643,34 +647,36 @@ impl RaftService for Node {
             // step down
             rf.set_state(args.term, false, false);
             let log_index = args.prev_log_index as usize;
-            if log_index < rf.log.len() && args.prev_log_term == rf.log[log_index].term {   // match
-                debug!("log match");
-                reply.success = true;
-                for i in 0..args.entries.len() {
-                    // append entries, delete if conflicts
-                    let entry_encode = args.entries[i].clone();
-                    if let Ok(decode) = labcodec::decode(&entry_encode) {
-                        let entry: LogEntry = decode;
-                        let append_index = log_index + 1 + i;
-                        if append_index >= rf.log.len() {
-                            debug!("{}: append entry(index:{})", rf.me, append_index);
-                            rf.log.push(entry);
-                            continue;
-                        }
-                        if entry == rf.log[append_index] {
-                            continue;
-                        } else {    // conflict
-                            // delete the existing entry and all that follow it
-                            let _ = rf.log.drain(append_index..);
-                            rf.log.push(entry);
+            if log_index < rf.log.len() {   // match
+                if args.prev_log_term == rf.log[log_index].term {
+                    debug!("{}: log match", rf.me);
+                    reply.success = true;
+                    for i in 0..args.entries.len() {
+                        // append entries, delete if conflicts
+                        let entry_encode = args.entries[i].clone();
+                        if let Ok(decode) = labcodec::decode(&entry_encode) {
+                            let entry: LogEntry = decode;
+                            let append_index = log_index + 1 + i;
+                            if append_index >= rf.log.len() {
+                                debug!("{}: append entry(index:{})", rf.me, append_index);
+                                rf.log.push(entry);
+                                continue;
+                            }
+                            if entry == rf.log[append_index] {
+                                continue;
+                            } else {    // conflict
+                                // delete the existing entry and all that follow it
+                                let _ = rf.log.drain(append_index..);
+                                rf.log.push(entry);
+                            }
                         }
                     }
+                    // update commitIndex
+                    let new_commit_index = cmp::min(args.leader_commit, rf.log.len() as u64 - 1);
+                    rf.set_commit_index(new_commit_index);
+                } else {
+                    let _ = rf.log.drain(log_index..);
                 }
-                // update commitIndex
-                let new_commit_index = cmp::min(args.leader_commit, rf.log.len() as u64 - 1);
-                rf.set_commit_index(new_commit_index);
-            } else {    // dismatch
-                let _ = rf.log.drain(log_index..);
             }
         }
 
