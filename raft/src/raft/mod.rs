@@ -1,3 +1,4 @@
+use std::io::Result as IoResult;
 use std::cmp;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -372,7 +373,8 @@ impl Node {
                         if ret == 1 {   // reset timer
                             continue;
                         } else if ret == 2 {  // stop timer
-                            thread::park();
+                            // thread::park();
+                            break;
                         }
                     },
                     Err(_) => { // timeout elapses
@@ -380,7 +382,6 @@ impl Node {
                             continue;
                         };
                         // Start election, meanwhile convert to candidate.
-                        // TODO: thread::spawn
                         node_clone.start_election();
                     }
                 }
@@ -403,7 +404,8 @@ impl Node {
 
     /// Unpark election_time thread.
     fn restart_election_timer(&self) {
-        self.election_timer.lock().unwrap().as_ref().unwrap().thread().unpark();
+        // self.election_timer.lock().unwrap().as_ref().unwrap().thread().unpark();
+        self.create_election_timer();
     }
 
     fn start_election(&self) {
@@ -460,7 +462,9 @@ impl Node {
                             // };
                             // rf.log.push(blank_entry);
                             node.stop_election_timer();
-                            node.start_heartbeat_timer();
+                            let (handle, sender) = node.start_heartbeat_timer().unwrap();
+                            *node.heartbeat_timer.lock().unwrap() = Some(handle);
+                            *node.heartbeat_reset_sender.lock().unwrap() = Some(sender);
                         }
                     } else if reply.term > term {
                         if rf.state.is_leader() {   // already won the eleciton before this reply
@@ -477,16 +481,16 @@ impl Node {
                 // debug!("{} to {} thread end", me, i);
             });
             if let Err(e) = result {
-                println!("{} to {} RV thread spawn: {}", me, i, e);
+                println!("{} to {} RV thread spawn failed: {}", me, i, e);
             }
         }
     }
 
-    fn start_heartbeat_timer(&self) {
+    fn start_heartbeat_timer(&self) -> IoResult<(thread::JoinHandle<()>, Sender<usize>)> {
         let (tx, rx) = mpsc::channel();
 
         let node_clone = self.clone();
-        let timer_thread = thread::spawn(move || {
+        let result = thread::Builder::new().spawn(move || {
             loop {
                 match rx.recv_timeout(Duration::from_millis(HEARTBEAT_INTERVAL)) {
                     Ok(ret) => {    // receive a signal
@@ -500,10 +504,12 @@ impl Node {
                 }
             }
             *node_clone.heartbeat_timer.lock().unwrap() = None;
+            *node_clone.heartbeat_reset_sender.lock().unwrap() = None;
         });
-
-        *self.heartbeat_timer.lock().unwrap() = Some(timer_thread);
-        *self.heartbeat_reset_sender.lock().unwrap() = Some(tx);
+        match result {
+            Ok(handle) => Ok((handle, tx)),
+            Err(e) => Err(e),
+        }
     }
 
     fn stop_heartbeat_timer(&self) {
@@ -512,7 +518,7 @@ impl Node {
 
     fn heartbeat(&self) {
         let rf = self.raft.lock().unwrap();
-        // debug!("{}: heartbeat", rf.me);
+        debug!("{}: heartbeat", rf.me);
         let peers_len = rf.peers_len();
         for i in 0..peers_len {
             if i == rf.me {
@@ -541,9 +547,9 @@ impl Node {
             let me = rf.me;
             let result = thread::Builder::new().spawn(move || {
             //thread::spawn(move || {
-                debug!("{}: send AE rpc to {}", me, i);
-                debug!("{} -> {} term: {}, leader_id: {}, prev_log_index: {}, prev_log_term: {}, leader_commit: {}, entries_len: {}", me, i,
-                    args.term, args.leader_id, args.prev_log_index, args.prev_log_term, args.leader_commit, args.entries.len());
+                // debug!("{}: send AE rpc to {}", me, i);
+                // debug!("{} -> {} term: {}, leader_id: {}, prev_log_index: {}, prev_log_term: {}, leader_commit: {}, entries_len: {}", me, i,
+                //     args.term, args.leader_id, args.prev_log_index, args.prev_log_term, args.leader_commit, args.entries.len());
                 if let Ok(reply) = peer.append_entries(&args).map_err(Error::Rpc).wait() { // receive a RPC reply
                     let mut rf = node.raft.lock().unwrap();
                     if reply.success {
@@ -564,7 +570,7 @@ impl Node {
                                         appended += 1;
                                     }
                                 }
-                                debug!("appended: {}", appended);
+                                debug!("entry(index:{}) appended: {}", index, appended);
                                 if appended > rf.peers.len() / 2 && rf.log[index as usize].term == rf.state.term(){
                                     rf.set_commit_index(index);
                                     break;
@@ -586,10 +592,10 @@ impl Node {
                         rf.next_index = Some(next_index);
                     }
                 }
-                debug!("{} to {} thread end", me, i);
+                // debug!("{} to {} thread end", me, i);
             });
             if let Err(e) = result {
-                println!("{} to {} AE thread spawn: {}", me, i, e);
+                println!("{} to {} AE thread spawn failed: {}", me, i, e);
             }
         }
     }
@@ -655,6 +661,29 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        if self.is_leader() {
+            self.stop_heartbeat_timer();
+            let thread = self.heartbeat_timer.lock().unwrap().take();
+            if thread.is_some() {
+                let mut rf = self.raft.lock().unwrap();
+                let term = rf.state.term();
+                rf.set_state(term, false, false);
+                debug!("{}: join heartbear_timer thread", rf.me);
+                let _ = thread.unwrap().join();
+                debug!("{}: heartbear_timer thread done", rf.me);
+            }
+        } else {
+            self.stop_election_timer();
+            let thread = self.election_timer.lock().unwrap().take();
+            if thread.is_some() {
+                let mut rf = self.raft.lock().unwrap();
+                let term = rf.state.term();
+                rf.set_state(term, false, false);
+                debug!("{}: join election_timer thread", rf.me);
+                let _ = thread.unwrap().join();
+                debug!("{}: election_timer thread done", rf.me);
+            }
+        }
     }
 }
 
