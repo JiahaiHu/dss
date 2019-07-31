@@ -9,6 +9,8 @@ use futures::{sync::mpsc::unbounded, Stream};
 use labrpc::RpcFuture;
 
 extern crate tokio;
+use tokio::runtime::Runtime;
+// use tokio::prelude::*;
 
 /// command entry
 #[derive(Clone, PartialEq, Message)]
@@ -64,15 +66,18 @@ impl KvServer {
 
         let ready_reply = server.ready_reply.clone();
         let storage = server.db.clone();
+        let me = server.me;
         let apply = apply_ch.for_each(move |cmd: raft::ApplyMsg| {
             // TODO: do not apply if this entry has already been applied
-            debug!("apply");
+            // debug!("apply");
             if !cmd.command_valid {
                 return Ok(());
             }
             if let Ok(decode) = labcodec::decode(&cmd.command) {
                 let entry: KvEntry = decode;
-                if let Some(reply) = ready_reply.lock().unwrap().get(&entry.key) {
+                let mut replys = ready_reply.lock().unwrap();
+                if let Some(reply) = replys.get(&entry.client_name) {
+                    debug!("index: {}, reply.seq: {}, entry.seq: {}", cmd.command_index,reply.seq, entry.seq);
                     if reply.seq >= entry.seq {
                         return Ok(());
                     }
@@ -86,15 +91,21 @@ impl KvServer {
                         if let Some(value) = storage.lock().unwrap().get(&entry.key) {
                             reply.value = value.clone();
                         }
-                        ready_reply.lock().unwrap().insert(entry.client_name, reply);
+                        replys.insert(entry.client_name, reply);
                     }
                     2 => {  // put
+                        debug!("apply(put), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
                         storage.lock().unwrap().insert(entry.key, entry.value);
-                        ready_reply.lock().unwrap().insert(entry.client_name, reply);
+                        replys.insert(entry.client_name, reply);
                     }
                     3 => {  // append
-                        storage.lock().unwrap().get_mut(&entry.key).unwrap().push_str(&entry.value);
-                        ready_reply.lock().unwrap().insert(entry.client_name, reply);
+                        debug!("apply(append), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
+                        if let Some(mut_ref) = storage.lock().unwrap().get_mut(&entry.key) {
+                            mut_ref.push_str(&entry.value);
+                        } else {    // perform as put
+                            storage.lock().unwrap().insert(entry.key, entry.value);
+                        }
+                        replys.insert(entry.client_name, reply);
                     }
                     _ => {
 
@@ -104,7 +115,11 @@ impl KvServer {
             Ok(())
         });
         let thread = thread::spawn(move || {
-            tokio::run(apply);
+            // tokio::run(apply);
+            let mut rt = Runtime::new().unwrap();
+            rt.spawn(apply);
+            thread::park();
+            // rt.shutdown_now().wait().unwrap();
         });
         server.apply_thread = Some(thread);
 
@@ -146,6 +161,13 @@ impl Node {
     /// turn off debug output from this instance.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let server = self.server.lock().unwrap();
+        server.rf.kill();
+        // let apply_thread = server.apply_thread.take();
+        // if let Some(thread) = apply_thread {
+        //     thread.thread().unpark();
+        //     thread.join().unwrap();
+        // }
     }
 
     /// The current term of this peer.
@@ -168,7 +190,7 @@ impl Node {
 impl KvService for Node {
     fn get(&self, arg: GetRequest) -> RpcFuture<GetReply> {
         // Your code here.
-        debug!("get");
+        // debug!("get");
         let mut reply = GetReply {
             wrong_leader: true,
             err: String::new(),
@@ -202,6 +224,7 @@ impl KvService for Node {
                 op: 1,
                 value: String::new(),
             };
+            debug!("get, client: {}, seq: {}, key: {}", cmd.client_name.clone(), cmd.seq, cmd.key.clone());
             match server.rf.start(&cmd) {
                 Ok((index, term)) => {
                     reply.wrong_leader = false;
@@ -217,7 +240,7 @@ impl KvService for Node {
 
     fn put_append(&self, arg: PutAppendRequest) -> RpcFuture<PutAppendReply> {
         // Your code here.
-        debug!("put_append");
+        // debug!("put_append");
         let mut reply = PutAppendReply {
             wrong_leader: true,
             err: String::new(),
@@ -225,8 +248,9 @@ impl KvService for Node {
             seq: 0,
         };
         let server = self.server.lock().unwrap();
-        debug!("try get reply");
+        // debug!("try get reply");
         if let Some(rep) = server.ready_reply.lock().unwrap().get(&arg.client_name) {
+            debug!("arg.seq: {}, reply.seq: {}", arg.seq, rep.seq);
             reply.seq = rep.seq;
             if arg.seq == rep.seq { //ready
                 reply.wrong_leader = false;
@@ -240,7 +264,7 @@ impl KvService for Node {
             }
         }
         drop(server);
-        debug!("not ready");
+        // debug!("not ready");
         // not ready (or maybe the first time to request)
         if self.is_leader() {
             let server = self.server.lock().unwrap();
@@ -251,7 +275,7 @@ impl KvService for Node {
                 op: arg.op,
                 value: arg.value,
             };
-            debug!("start");
+            debug!("put_append, client: {}, seq: {}, key: {}, value: {}", cmd.client_name.clone(), cmd.seq, cmd.key.clone(), cmd.value.clone());
             match server.rf.start(&cmd) {
                 Ok((index, term)) => {
                     reply.wrong_leader = false;
@@ -262,7 +286,7 @@ impl KvService for Node {
                 }
             }
         }
-        debug!("reply");
+        // debug!("reply");
         Box::new(futures::future::result(Ok(reply)))
     }
 }

@@ -182,7 +182,7 @@ impl Raft {
                 command: self.log[j as usize].command.clone(),
                 command_index: j,
             };
-            debug!("{}: apply entry({})", self.me, apply_msg.command_index);
+            // debug!("{}: apply entry({})", self.me, apply_msg.command_index);
             let _ = self.apply_ch.unbounded_send(apply_msg);
             self.last_applied += 1;
         }

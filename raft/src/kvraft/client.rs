@@ -114,7 +114,7 @@ impl Clerk {
             debug!("client {}:put_append", req.client_name.clone());
             match self.servers[leader].put_append(&req).wait() {
                 Ok(reply) => {
-                    debug!("receive reply");
+                    debug!("receive reply, wrong_leader: {}, ready: {}, seq: {}, err: {}", reply.wrong_leader, reply.ready, reply.seq, reply.err);
                     if !reply.wrong_leader {
                         if reply.ready {
                             if req.seq == reply.seq {
