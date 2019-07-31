@@ -3,9 +3,12 @@ use crate::raft;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use futures::{sync::mpsc::unbounded, Stream};
 use labrpc::RpcFuture;
+
+extern crate tokio;
 
 /// command entry
 #[derive(Clone, PartialEq, Message)]
@@ -33,9 +36,9 @@ pub struct KvServer {
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
     // Your definitions here.
-    db: HashMap<String, String>,
-    ready_reply: HashMap<String, ReadyReply>,
-    last_seq_applied: HashMap<String, u64>,
+    db: Arc<Mutex<HashMap<String, String>>>,
+    ready_reply: Arc<Mutex<HashMap<String, ReadyReply>>>,
+    apply_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl KvServer {
@@ -50,32 +53,60 @@ impl KvServer {
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
 
-        let server = KvServer {
+        let mut server = KvServer {
             me,
             maxraftstate,
             rf: raft::Node::new(rf),
-            db: HashMap::new(),
-            ready_reply: HashMap::new(),
-            last_seq_applied: HashMap::new(),
+            db: Arc::new(Mutex::new(HashMap::new())),
+            ready_reply: Arc::new(Mutex::new(HashMap::new())),
+            apply_thread: None,
         };
 
+        let ready_reply = server.ready_reply.clone();
+        let storage = server.db.clone();
         let apply = apply_ch.for_each(move |cmd: raft::ApplyMsg| {
             // TODO: do not apply if this entry has already been applied
+            debug!("apply");
             if !cmd.command_valid {
                 return Ok(());
             }
             if let Ok(decode) = labcodec::decode(&cmd.command) {
                 let entry: KvEntry = decode;
-                // TODO: lock last_seq_applied
-                // if let Some(seq) = server.last_seq_applied.get(&entry.key) {
-                //     return Ok(());
-                // }
+                if let Some(reply) = ready_reply.lock().unwrap().get(&entry.key) {
+                    if reply.seq >= entry.seq {
+                        return Ok(());
+                    }
+                }
+                let mut reply = ReadyReply {
+                    seq: entry.seq,
+                    value: String::new(),
+                };
+                match entry.op {
+                    1 => {  // get
+                        if let Some(value) = storage.lock().unwrap().get(&entry.key) {
+                            reply.value = value.clone();
+                        }
+                        ready_reply.lock().unwrap().insert(entry.client_name, reply);
+                    }
+                    2 => {  // put
+                        storage.lock().unwrap().insert(entry.key, entry.value);
+                        ready_reply.lock().unwrap().insert(entry.client_name, reply);
+                    }
+                    3 => {  // append
+                        storage.lock().unwrap().get_mut(&entry.key).unwrap().push_str(&entry.value);
+                        ready_reply.lock().unwrap().insert(entry.client_name, reply);
+                    }
+                    _ => {
 
+                    }
+                }
             }
             Ok(())
         });
-
-        
+        let thread = thread::spawn(move || {
+            tokio::run(apply);
+        });
+        server.apply_thread = Some(thread);
 
         server
     }
@@ -137,6 +168,7 @@ impl Node {
 impl KvService for Node {
     fn get(&self, arg: GetRequest) -> RpcFuture<GetReply> {
         // Your code here.
+        debug!("get");
         let mut reply = GetReply {
             wrong_leader: true,
             err: String::new(),
@@ -145,7 +177,7 @@ impl KvService for Node {
             seq: 0,
         };
         let server = self.server.lock().unwrap();
-        if let Some(rep) = server.ready_reply.get(&arg.client_name) {
+        if let Some(rep) = server.ready_reply.lock().unwrap().get(&arg.client_name) {
             reply.seq = rep.seq;
             if arg.seq == rep.seq { //ready
                 reply.wrong_leader = false;
@@ -159,6 +191,7 @@ impl KvService for Node {
                 return Box::new(futures::future::result(Ok(reply)));
             }
         }
+        drop(server);
         // not ready (or maybe the first time to request)
         if self.is_leader() {
             let server = self.server.lock().unwrap();
@@ -184,6 +217,7 @@ impl KvService for Node {
 
     fn put_append(&self, arg: PutAppendRequest) -> RpcFuture<PutAppendReply> {
         // Your code here.
+        debug!("put_append");
         let mut reply = PutAppendReply {
             wrong_leader: true,
             err: String::new(),
@@ -191,7 +225,8 @@ impl KvService for Node {
             seq: 0,
         };
         let server = self.server.lock().unwrap();
-        if let Some(rep) = server.ready_reply.get(&arg.client_name) {
+        debug!("try get reply");
+        if let Some(rep) = server.ready_reply.lock().unwrap().get(&arg.client_name) {
             reply.seq = rep.seq;
             if arg.seq == rep.seq { //ready
                 reply.wrong_leader = false;
@@ -204,6 +239,8 @@ impl KvService for Node {
                 return Box::new(futures::future::result(Ok(reply)));
             }
         }
+        drop(server);
+        debug!("not ready");
         // not ready (or maybe the first time to request)
         if self.is_leader() {
             let server = self.server.lock().unwrap();
@@ -214,6 +251,7 @@ impl KvService for Node {
                 op: arg.op,
                 value: arg.value,
             };
+            debug!("start");
             match server.rf.start(&cmd) {
                 Ok((index, term)) => {
                     reply.wrong_leader = false;
@@ -224,6 +262,7 @@ impl KvService for Node {
                 }
             }
         }
+        debug!("reply");
         Box::new(futures::future::result(Ok(reply)))
     }
 }

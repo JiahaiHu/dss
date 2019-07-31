@@ -111,8 +111,10 @@ impl Clerk {
         let mut leader = self.leader.load(Ordering::SeqCst);
 
         loop {
+            debug!("client {}:put_append", req.client_name.clone());
             match self.servers[leader].put_append(&req).wait() {
                 Ok(reply) => {
+                    debug!("receive reply");
                     if !reply.wrong_leader {
                         if reply.ready {
                             if req.seq == reply.seq {
@@ -127,6 +129,7 @@ impl Clerk {
                     }
                 }
                 Err(_) => { // timeout
+                    debug!("wait reply timeout");
                     leader = (leader + 1) % servers;
                 }
             }
