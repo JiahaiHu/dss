@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use futures::{sync::mpsc::unbounded, Stream};
+use futures::sync::mpsc::UnboundedReceiver;
 use labrpc::RpcFuture;
 
 extern crate tokio;
@@ -41,6 +42,7 @@ pub struct KvServer {
     db: Arc<Mutex<HashMap<String, String>>>,
     ready_reply: Arc<Mutex<HashMap<String, ReadyReply>>>,
     apply_thread: Option<thread::JoinHandle<()>>,
+    pub apply_ch: Option<UnboundedReceiver<raft::ApplyMsg>>,
 }
 
 impl KvServer {
@@ -55,75 +57,15 @@ impl KvServer {
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
 
-        let mut server = KvServer {
+        KvServer {
             me,
             maxraftstate,
             rf: raft::Node::new(rf),
             db: Arc::new(Mutex::new(HashMap::new())),
             ready_reply: Arc::new(Mutex::new(HashMap::new())),
             apply_thread: None,
-        };
-
-        let ready_reply = server.ready_reply.clone();
-        let storage = server.db.clone();
-        let me = server.me;
-        let apply = apply_ch.for_each(move |cmd: raft::ApplyMsg| {
-            // TODO: do not apply if this entry has already been applied
-            // debug!("apply");
-            if !cmd.command_valid {
-                return Ok(());
-            }
-            if let Ok(decode) = labcodec::decode(&cmd.command) {
-                let entry: KvEntry = decode;
-                let mut replys = ready_reply.lock().unwrap();
-                if let Some(reply) = replys.get(&entry.client_name) {
-                    debug!("index: {}, reply.seq: {}, entry.seq: {}", cmd.command_index,reply.seq, entry.seq);
-                    if reply.seq >= entry.seq {
-                        return Ok(());
-                    }
-                }
-                let mut reply = ReadyReply {
-                    seq: entry.seq,
-                    value: String::new(),
-                };
-                match entry.op {
-                    1 => {  // get
-                        if let Some(value) = storage.lock().unwrap().get(&entry.key) {
-                            reply.value = value.clone();
-                        }
-                        replys.insert(entry.client_name, reply);
-                    }
-                    2 => {  // put
-                        debug!("apply(put), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
-                        storage.lock().unwrap().insert(entry.key, entry.value);
-                        replys.insert(entry.client_name, reply);
-                    }
-                    3 => {  // append
-                        debug!("apply(append), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
-                        if let Some(mut_ref) = storage.lock().unwrap().get_mut(&entry.key) {
-                            mut_ref.push_str(&entry.value);
-                        } else {    // perform as put
-                            storage.lock().unwrap().insert(entry.key, entry.value);
-                        }
-                        replys.insert(entry.client_name, reply);
-                    }
-                    _ => {
-
-                    }
-                }
-            }
-            Ok(())
-        });
-        let thread = thread::spawn(move || {
-            // tokio::run(apply);
-            let mut rt = Runtime::new().unwrap();
-            rt.spawn(apply);
-            thread::park();
-            // rt.shutdown_now().wait().unwrap();
-        });
-        server.apply_thread = Some(thread);
-
-        server
+            apply_ch: Some(apply_ch),
+        }
     }
 }
 
@@ -150,9 +92,76 @@ pub struct Node {
 impl Node {
     pub fn new(kv: KvServer) -> Node {
         // Your code here.
-        Node {
+        let node = Node {
             server: Arc::new(Mutex::new(kv)),
-        }
+        };
+
+        let mut server = node.server.lock().unwrap();
+        let apply_ch = server.apply_ch.take().unwrap();
+        drop(server);   // drop mutable borrow
+
+        let server = node.server.clone();
+        let apply = apply_ch.for_each(move |cmd: raft::ApplyMsg| {
+            // TODO: do not apply if this entry has already been applied
+            // debug!("apply");
+            if !cmd.command_valid {
+                return Ok(());
+            }
+
+            let server = server.lock().unwrap();
+            let mut storage = server.db.lock().unwrap();
+
+            if let Ok(decode) = labcodec::decode(&cmd.command) {
+                let entry: KvEntry = decode;
+                let mut replys = server.ready_reply.lock().unwrap();
+                if let Some(reply) = replys.get(&entry.client_name) {
+                    debug!("index: {}, reply.seq: {}, entry.seq: {}", cmd.command_index,reply.seq, entry.seq);
+                    if reply.seq >= entry.seq {
+                        return Ok(());
+                    }
+                }
+                let mut reply = ReadyReply {
+                    seq: entry.seq,
+                    value: String::new(),
+                };
+                match entry.op {
+                    1 => {  // get
+                        if let Some(value) = storage.get(&entry.key) {
+                            reply.value = value.clone();
+                        }
+                        replys.insert(entry.client_name, reply);
+                    }
+                    2 => {  // put
+                        debug!("apply(put), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, server.me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
+                        storage.insert(entry.key, entry.value);
+                        replys.insert(entry.client_name, reply);
+                        // server.save_snapshot();
+                    }
+                    3 => {  // append
+                        debug!("apply(append), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, server.me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
+                        if let Some(mut_ref) = storage.get_mut(&entry.key) {
+                            mut_ref.push_str(&entry.value);
+                        } else {    // perform as put
+                            storage.insert(entry.key, entry.value);
+                        }
+                        replys.insert(entry.client_name, reply);
+                    }
+                    _ => {
+
+                    }
+                }
+            }
+            Ok(())
+        });
+        let thread = thread::spawn(move || {
+            // tokio::run(apply);
+            let mut rt = Runtime::new().unwrap();
+            rt.spawn(apply);
+            thread::park();
+            // rt.shutdown_now().wait().unwrap();
+        });
+        node.server.lock().unwrap().apply_thread = Some(thread);
+        node
     }
 
     /// the tester calls Kill() when a KVServer instance won't
