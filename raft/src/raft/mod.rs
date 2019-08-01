@@ -189,15 +189,7 @@ impl Raft {
         self.persist();
     }
 
-    /// save Raft's persistent state to stable storage,
-    /// where it can later be retrieved after a crash and restart.
-    /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+    fn encode_state(&self) -> Vec<u8> {
         let mut encode = vec![];
         let mut voted_for: i64 = -1;
         if self.voted_for.is_some() {
@@ -216,7 +208,25 @@ impl Raft {
             p_state.log.push(buf);
         }
         let _ = labcodec::encode(&p_state, &mut encode).map_err(Error::Encode);
-        self.persister.save_raft_state(encode);
+        encode
+    }
+
+    pub fn save_state_and_snapshot(&self, snapshot: Vec<u8>) {
+        let state = self.encode_state();
+        self.persister.save_state_and_snapshot(state, snapshot);
+    }
+
+    /// save Raft's persistent state to stable storage,
+    /// where it can later be retrieved after a crash and restart.
+    /// see paper's Figure 2 for a description of what should be persistent.
+    fn persist(&mut self) {
+        // Your code here (2C).
+        // Example:
+        // labcodec::encode(&self.xxx, &mut data).unwrap();
+        // labcodec::encode(&self.yyy, &mut data).unwrap();
+        // self.persister.save_raft_state(data);
+        let state = self.encode_state();
+        self.persister.save_raft_state(state);
     }
 
     /// restore previously persisted state.
@@ -599,6 +609,10 @@ impl Node {
                 println!("{} to {} AE thread spawn failed: {}", me, i, e);
             }
         }
+    }
+
+    pub fn save_state_and_snapshot(&self, snapshot: Vec<u8>) {
+        self.raft.lock().unwrap().save_state_and_snapshot(snapshot);
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
