@@ -203,6 +203,11 @@ impl Raft {
         }
     }
 
+    /// map index of log entry to index of vector(self.log)
+    pub fn map_index(&self, index: usize) -> usize {
+        index - self.snapshot.last_included_index as usize - 1
+    }
+
     /// update commitIndex and try to apply
     pub fn set_commit_index(&mut self, new_commit_index: u64) {
         // debug!("{}: update commit_index({})", self.me, new_commit_index);
@@ -211,7 +216,7 @@ impl Raft {
         }
         self.commit_index = new_commit_index;
         for j in self.last_applied + 1..=self.commit_index {
-            let index = j - self.snapshot.last_included_index - 1;
+            let index = self.map_index(j as usize);
             let apply_msg = ApplyMsg {
                 command_valid: true,
                 command: self.log[index as usize].command.clone(),
@@ -262,12 +267,12 @@ impl Raft {
         if maxraftstate > self.persister.raft_state().len() {
             return;
         }
-        let compress_len = snapshot_index - self.snapshot.last_included_index;
+        let discarded_index = self.map_index(snapshot_index as usize);
         self.snapshot = SnapshotState {
             last_included_index: snapshot_index,
-            last_included_term: self.log[compress_len as usize - 1].term,
+            last_included_term: self.log[discarded_index].term,
         };
-        self.discard_entries_before(compress_len);
+        self.discard_entries_before(discarded_index as u64 + 1);
         self.persist();
     }
 
@@ -637,8 +642,8 @@ impl Node {
             let prev_log_term = if prev_log_index == last_included_index {
                 rf.snapshot.last_included_term
             } else {
-                let index = prev_log_index - last_included_index;
-                rf.log[index as usize - 1].term
+                let index = rf.map_index(prev_log_index as usize);
+                rf.log[index].term
             };
             let mut entries = Vec::new();
             for j in (prev_log_index - last_included_index) as usize..rf.log.len() {
@@ -685,8 +690,8 @@ impl Node {
                                     }
                                 }
                                 debug!("entry(index:{} term:{}) appended: {}", index, reply.term, appended);
-                                let j = index - rf.snapshot.last_included_index - 1;
-                                if appended > rf.peers.len() / 2 && rf.log[j as usize].term == rf.state.term(){
+                                let j = rf.map_index(index as usize);
+                                if appended > rf.peers.len() / 2 && rf.log[j].term == rf.state.term(){
                                     rf.set_commit_index(index);
                                     break;
                                 }
@@ -876,8 +881,8 @@ impl RaftService for Node {
                 let log_term = if log_index == last_included_index {
                     rf.snapshot.last_included_term
                 } else {
-                    let index = log_index - last_included_index;
-                    rf.log[index as usize - 1].term
+                    let index = rf.map_index(log_index);
+                    rf.log[index].term
                 };
                 // debug!("args.prev_log_term: {}, log_term: {}", args.prev_log_term, log_term);
                 if args.prev_log_term == log_term {   // match
@@ -896,7 +901,7 @@ impl RaftService for Node {
                                 rf.persist();
                                 continue;
                             }
-                            let index = append_index - last_included_index - 1;
+                            let index = rf.map_index(append_index);
                             if entry == rf.log[index] {
                                 continue;
                             } else {    // conflict
@@ -914,7 +919,7 @@ impl RaftService for Node {
                 } else {    // mismatch
                     let mut expected_next_index = log_index;
                     let term = args.prev_log_term;
-                    let index = log_index - last_included_index - 1;
+                    let index = rf.map_index(log_index);
                     for i in (0..index).rev() {
                         if term == rf.log[i].term {
                             expected_next_index = last_included_index + 1 + i;
@@ -924,7 +929,7 @@ impl RaftService for Node {
                     }
                     reply.expected_next_index = expected_next_index as u64;
                     if log_index > last_included_index {    // always true, no way to conflict with snapshot
-                        let index = log_index - last_included_index - 1;
+                        let index = rf.map_index(log_index);
                         rf.log.drain(index..);
                         rf.persist();
                     }
@@ -965,8 +970,8 @@ impl RaftService for Node {
                     retained_index = index + 1;
                 }
             }
-            let index = retained_index as u64 - last_included_index - 1;
-            rf.discard_entries_before(index);
+            let index = rf.map_index(retained_index);
+            rf.discard_entries_before(index as u64);
             // update raft state
             rf.commit_index = args.last_included_index;
             rf.last_applied = args.last_included_index;
