@@ -42,7 +42,7 @@ understand please [file issues].
 [CC-BY 4.0](https://opendefinition.org/licenses/cc-by/)
 
 <!-- links -->
-[rust]: ../rust/README.md
+[rust]: [../rust/README.md](https://github.com/pingcap/talent-plan/blob/master/rust/README.md)
 [file issues]: https://github.com/pingcap/talent-plan/issues/
 [Deep Dive TiKV]: https://tikv.org/deep-dive/
 [TiKV]: https://github.com/tikv/tikv/
