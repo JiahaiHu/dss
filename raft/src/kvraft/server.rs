@@ -233,7 +233,7 @@ impl Node {
                         server.persist_storage();
                         server.snapshot_index = cmd.command_index;
                         if let Some(max) = server.maxraftstate {
-                            server.rf.compress_log_if_need(max, cmd.command_index);
+                            server.rf.compress_log_if_need(max, cmd.command_index as usize);
                         }
                     }
                     3 => {  // append
@@ -247,7 +247,7 @@ impl Node {
                         server.persist_storage();
                         server.snapshot_index = cmd.command_index;
                         if let Some(max) = server.maxraftstate {
-                            server.rf.compress_log_if_need(max, cmd.command_index);
+                            server.rf.compress_log_if_need(max, cmd.command_index as usize);
                         }
                     }
                     _ => {
