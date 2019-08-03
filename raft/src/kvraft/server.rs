@@ -58,6 +58,7 @@ pub struct KvServer {
     ready_reply: HashMap<String, ReadyReply>,
     apply_thread: Option<thread::JoinHandle<()>>,
     apply_ch: Option<UnboundedReceiver<raft::ApplyMsg>>,
+    snapshot_index: u64,
 }
 
 impl KvServer {
@@ -80,6 +81,7 @@ impl KvServer {
             ready_reply: HashMap::new(),
             apply_thread: None,
             apply_ch: Some(apply_ch),
+            snapshot_index: 0,
         };
 
         server.install_snapshot(&snapshot);
@@ -197,12 +199,14 @@ impl Node {
 
         let server = node.server.clone();
         let apply = apply_ch.for_each(move |cmd: raft::ApplyMsg| {
-            if !cmd.command_valid {
+            let mut server = server.lock().unwrap();
+            if !cmd.command_valid { // this apply message is a snapshot
+                if server.snapshot_index < cmd.command_index {
+                    server.install_snapshot(&cmd.snapshot);
+                }
                 return Ok(());
             }
-
-            let mut server = server.lock().unwrap();
-
+            
             if let Ok(decode) = labcodec::decode(&cmd.command) {
                 let entry: KvEntry = decode;
                 if let Some(reply) = server.ready_reply.get(&entry.client_name) {
@@ -227,6 +231,10 @@ impl Node {
                         server.db.insert(entry.key, entry.value);
                         server.ready_reply.insert(entry.client_name, reply);
                         server.persist_storage();
+                        server.snapshot_index = cmd.command_index;
+                        if let Some(max) = server.maxraftstate {
+                            server.rf.compress_log_if_need(max, cmd.command_index);
+                        }
                     }
                     3 => {  // append
                         debug!("apply(append), index: {}, server: {}, client: {}, seq: {}, key: {}, value: {}", cmd.command_index, server.me, entry.client_name.clone(), entry.seq, entry.key.clone(), entry.value.clone());
@@ -237,6 +245,10 @@ impl Node {
                         }
                         server.ready_reply.insert(entry.client_name, reply);
                         server.persist_storage();
+                        server.snapshot_index = cmd.command_index;
+                        if let Some(max) = server.maxraftstate {
+                            server.rf.compress_log_if_need(max, cmd.command_index);
+                        }
                     }
                     _ => {
 

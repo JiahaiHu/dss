@@ -34,6 +34,7 @@ pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
     pub command_index: u64,
+    pub snapshot: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -215,6 +216,7 @@ impl Raft {
                 command_valid: true,
                 command: self.log[index as usize].command.clone(),
                 command_index: j,
+                snapshot: vec![],
             };
             debug!("{}: apply entry({})", self.me, apply_msg.command_index);
             let _ = self.apply_ch.unbounded_send(apply_msg);
@@ -912,7 +914,8 @@ impl RaftService for Node {
                 } else {    // mismatch
                     let mut expected_next_index = log_index;
                     let term = args.prev_log_term;
-                    for i in (0..log_index).rev() {
+                    let index = log_index - last_included_index - 1;
+                    for i in (0..index).rev() {
                         if term == rf.log[i].term {
                             expected_next_index = last_included_index + 1 + i;
                         } else {
@@ -962,7 +965,8 @@ impl RaftService for Node {
                     retained_index = index + 1;
                 }
             }
-            rf.discard_entries_before(retained_index as u64);
+            let index = retained_index as u64 - last_included_index - 1;
+            rf.discard_entries_before(index);
             // update raft state
             rf.commit_index = args.last_included_index;
             rf.last_applied = args.last_included_index;
@@ -978,7 +982,7 @@ impl RaftService for Node {
                 command_valid: false,   // set false for lab2
                 command: vec![],
                 command_index: args.last_included_index,
-                // TODO: snapshot: args.snapshot
+                snapshot: args.snapshot,
             };
             let _ = rf.apply_ch.unbounded_send(apply_msg);
         }
